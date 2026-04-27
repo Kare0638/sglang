@@ -244,6 +244,19 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+def _should_debug_abort_cache(rid: str) -> bool:
+    if os.getenv("SGLANG_DEBUG_ABORT_CACHE") != "1":
+        return False
+    rid_filter = os.getenv("SGLANG_DEBUG_ABORT_CACHE_RIDS", "").strip()
+    if not rid_filter:
+        return True
+    return any(token and token in rid for token in rid_filter.split(","))
+
+
+def _debug_node_id(node: object) -> str:
+    return f"{type(node).__name__}@{id(node):x}" if node is not None else "None"
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -3376,6 +3389,19 @@ class Scheduler(
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+            if _should_debug_abort_cache(req.rid):
+                logger.info(
+                    "[issue-23392][abort.waiting] rid=%s req_pool_idx=%s last_node=%s "
+                    "cache_protected_len=%s kv_committed_len=%s kv_allocated_len=%s "
+                    "is_retracted=%s queue=waiting",
+                    req.rid,
+                    req.req_pool_idx,
+                    _debug_node_id(req.last_node),
+                    req.cache_protected_len,
+                    req.kv_committed_len,
+                    req.kv_allocated_len,
+                    req.is_retracted,
+                )
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -3383,6 +3409,16 @@ class Scheduler(
         # The request will still run one prefill forward pass.
         # In this case, we change the input_ids to be only one token to make this prefill cheap.
         self.grammar_manager.abort_requests(recv_req)
+
+        if _should_debug_abort_cache(recv_req.rid):
+            logger.info(
+                "[issue-23392][abort.entry] rid=%s abort_all=%s waiting_matches=%s "
+                "running_batch=%s",
+                recv_req.rid,
+                recv_req.abort_all,
+                len(to_del),
+                len(getattr(getattr(self, "running_batch", None), "reqs", [])),
+            )
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3442,6 +3478,17 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                if _should_debug_abort_cache(req.rid):
+                    logger.info(
+                        "[issue-23392][abort.running] rid=%s req_pool_idx=%s last_node=%s "
+                        "cache_protected_len=%s kv_committed_len=%s kv_allocated_len=%s",
+                        req.rid,
+                        req.req_pool_idx,
+                        _debug_node_id(req.last_node),
+                        req.cache_protected_len,
+                        req.kv_committed_len,
+                        req.kv_allocated_len,
+                    )
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

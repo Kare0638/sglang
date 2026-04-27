@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -32,6 +33,19 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _should_debug_abort_cache(rid: str) -> bool:
+    if os.getenv("SGLANG_DEBUG_ABORT_CACHE") != "1":
+        return False
+    rid_filter = os.getenv("SGLANG_DEBUG_ABORT_CACHE_RIDS", "").strip()
+    if not rid_filter:
+        return True
+    return any(token and token in rid for token in rid_filter.split(","))
+
+
+def _debug_node_id(node: object) -> str:
+    return f"{type(node).__name__}@{id(node):x}" if node is not None else "None"
 
 # How often (in decoded tokens) the scheduler force-flushes an intermediate
 # output batch for non-streaming requests.
@@ -196,9 +210,36 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
+                        if _should_debug_abort_cache(req.rid):
+                            logger.info(
+                                "[issue-23392][output.release] rid=%s reason=finished "
+                                "req_pool_idx=%s last_node=%s cache_protected_len=%s "
+                                "kv_committed_len=%s kv_allocated_len=%s",
+                                req.rid,
+                                req.req_pool_idx,
+                                _debug_node_id(req.last_node),
+                                req.cache_protected_len,
+                                req.kv_committed_len,
+                                req.kv_allocated_len,
+                            )
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                        if _should_debug_abort_cache(req.rid):
+                            logger.info(
+                                "[issue-23392][output.cache_unfinished] rid=%s "
+                                "req_pool_idx=%s last_node=%s cache_protected_len=%s "
+                                "fill_ids=%s output_len=%s next_token_id=%s "
+                                "is_retracted=%s",
+                                req.rid,
+                                req.req_pool_idx,
+                                _debug_node_id(req.last_node),
+                                req.cache_protected_len,
+                                len(req.fill_ids),
+                                len(req.output_ids),
+                                next_token_id,
+                                req.is_retracted,
+                            )
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)

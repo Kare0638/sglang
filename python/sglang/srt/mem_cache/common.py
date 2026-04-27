@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,6 +25,19 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+
+
+def _should_debug_abort_cache(rid: str) -> bool:
+    if os.getenv("SGLANG_DEBUG_ABORT_CACHE") != "1":
+        return False
+    rid_filter = os.getenv("SGLANG_DEBUG_ABORT_CACHE_RIDS", "").strip()
+    if not rid_filter:
+        return True
+    return any(token and token in rid for token in rid_filter.split(","))
+
+
+def _debug_node_id(node: object) -> str:
+    return f"{type(node).__name__}@{id(node):x}" if node is not None else "None"
 
 
 @triton.jit
@@ -553,11 +567,31 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    debug_enabled = _should_debug_abort_cache(req.rid)
+    if debug_enabled:
+        logger.info(
+            "[issue-23392][release.enter] rid=%s is_insert=%s req_pool_idx=%s "
+            "last_node=%s cache_protected_len=%s kv_committed_len=%s "
+            "kv_allocated_len=%s",
+            req.rid,
+            is_insert,
+            req.req_pool_idx,
+            _debug_node_id(req.last_node),
+            req.cache_protected_len,
+            req.kv_committed_len,
+            req.kv_allocated_len,
+        )
+
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # and bookkeeping flag sync internally, then sets req_pool_idx = None.
     if req.req_pool_idx is None:
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][release.done] rid=%s req_pool_idx_transferred=True",
+                req.rid,
+            )
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
@@ -576,10 +610,26 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
+    if debug_enabled:
+        logger.info(
+            "[issue-23392][release.range] rid=%s start_p=%s end_p=%s page_size=%s",
+            req.rid,
+            start_p,
+            end_p,
+            page_size,
+        )
+
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][release.free] rid=%s free_len=%s req_pool_idx=%s",
+                req.rid,
+                len(indices_to_free),
+                req.req_pool_idx,
+            )
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
@@ -590,6 +640,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     tree_cache.req_to_token_pool.free(req)
+    if debug_enabled:
+        logger.info("[issue-23392][release.exit] rid=%s req_pool_freed=True", req.rid)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

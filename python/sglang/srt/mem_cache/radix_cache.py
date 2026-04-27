@@ -24,6 +24,7 @@ The radix tree data structure for managing the KV cache.
 import hashlib
 import heapq
 import logging
+import os
 import sys
 import time
 from collections import defaultdict
@@ -33,6 +34,19 @@ from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _should_debug_abort_cache(rid: str) -> bool:
+    if os.getenv("SGLANG_DEBUG_ABORT_CACHE") != "1":
+        return False
+    rid_filter = os.getenv("SGLANG_DEBUG_ABORT_CACHE_RIDS", "").strip()
+    if not rid_filter:
+        return True
+    return any(token and token in rid for token in rid_filter.split(","))
+
+
+def _debug_node_id(node: object) -> str:
+    return f"{type(node).__name__}@{id(node):x}" if node is not None else "None"
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -459,11 +473,22 @@ class RadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        return MatchResult(
+        result = MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
         )
+        rid = os.getenv("SGLANG_DEBUG_ABORT_CACHE_MATCH_RID", "").strip()
+        if rid and _should_debug_abort_cache(rid):
+            logger.info(
+                "[issue-23392][radix.match_prefix] rid=%s key_len=%s matched_len=%s "
+                "last_node=%s",
+                rid,
+                len(key),
+                len(result.device_indices),
+                _debug_node_id(result.last_device_node),
+            )
+        return result
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -483,6 +508,18 @@ class RadixCache(BasePrefixCache):
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        debug_rid = os.getenv("SGLANG_DEBUG_ABORT_CACHE_INSERT_RID", "").strip()
+        if debug_rid and _should_debug_abort_cache(debug_rid):
+            logger.info(
+                "[issue-23392][radix.insert] rid=%s key_len=%s value_len=%s "
+                "prefix_len=%s chunked=%s priority=%s",
+                debug_rid,
+                len(key),
+                len(value),
+                prefix_len,
+                chunked,
+                priority,
+            )
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -503,12 +540,27 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        debug_enabled = _should_debug_abort_cache(req.rid)
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][radix.cache_finished.begin] rid=%s req_pool_idx=%s "
+                "last_node=%s cache_protected_len=%s key_len=%s kv_committed_len=%s "
+                "is_insert=%s",
+                req.rid,
+                req.req_pool_idx,
+                _debug_node_id(req.last_node),
+                req.cache_protected_len,
+                key_len,
+                kv_committed_len,
+                is_insert,
+            )
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -530,17 +582,40 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
         # Remove req slot release the cache lock
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][radix.dec_lock_ref] rid=%s node=%s lock_ref_before=%s "
+                "site=cache_finished",
+                req.rid,
+                _debug_node_id(req.last_node),
+                req.last_node.lock_ref,
+            )
         self.dec_lock_ref(req.last_node)
+
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][radix.cache_finished.end] rid=%s req_pool_idx=%s "
+                "last_node=%s freed_main=%s freed_tail=%s is_insert=%s",
+                req.rid,
+                req.req_pool_idx,
+                _debug_node_id(req.last_node),
+                max((new_prefix_len if is_insert else key_len) - req.cache_protected_len, 0),
+                max(len(kv_indices) - key_len, 0),
+                is_insert,
+            )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
 
+        debug_enabled = _should_debug_abort_cache(req.rid)
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        old_last_node = req.last_node
+        old_cache_protected_len = req.cache_protected_len
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
@@ -557,6 +632,20 @@ class RadixCache(BasePrefixCache):
             )
         )
         new_prefix_len = result.prefix_len
+
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][radix.cache_unfinished.begin] rid=%s req_pool_idx=%s "
+                "old_last_node=%s old_cache_protected_len=%s radix_key_len=%s "
+                "new_prefix_len=%s chunked=%s",
+                req.rid,
+                req.req_pool_idx,
+                _debug_node_id(old_last_node),
+                old_cache_protected_len,
+                len(radix_key),
+                new_prefix_len,
+                chunked,
+            )
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
@@ -583,7 +672,23 @@ class RadixCache(BasePrefixCache):
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
 
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][radix.dec_lock_ref] rid=%s node=%s lock_ref_before=%s "
+                "site=cache_unfinished",
+                req.rid,
+                _debug_node_id(req.last_node),
+                req.last_node.lock_ref,
+            )
         self.dec_lock_ref(req.last_node)
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][radix.inc_lock_ref] rid=%s node=%s lock_ref_before=%s "
+                "site=cache_unfinished",
+                req.rid,
+                _debug_node_id(new_last_node),
+                new_last_node.lock_ref,
+            )
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -597,6 +702,19 @@ class RadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+
+        if debug_enabled:
+            logger.info(
+                "[issue-23392][radix.cache_unfinished.end] rid=%s req_pool_idx=%s "
+                "new_last_node=%s new_cache_protected_len=%s new_indices_len=%s "
+                "freed_overlap=%s",
+                req.rid,
+                req.req_pool_idx,
+                _debug_node_id(new_last_node),
+                req.cache_protected_len,
+                len(new_indices),
+                max(new_prefix_len - old_cache_protected_len, 0),
+            )
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
