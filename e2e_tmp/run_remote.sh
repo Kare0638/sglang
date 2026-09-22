@@ -17,6 +17,8 @@ SRC=$(cd "$HERE/.." && pwd)
 LOG=$DATA/logs
 export HF_HOME=$DATA/huggingface UV_CACHE_DIR=$DATA/uv-cache CARGO_HOME=$DATA/cargo RUSTUP_HOME=$DATA/rustup
 export PATH="$SRC/.venv/bin:$CARGO_HOME/bin:$HOME/.local/bin:$PATH"
+# 和 CI 镜像 (nvidia/cuda:13.0.3-devel) 对齐；deep_ep / flashinfer JIT 都要 CUDA_HOME
+[ -d /usr/local/cuda-13.0 ] && export CUDA_HOME=/usr/local/cuda-13.0 PATH="/usr/local/cuda-13.0/bin:$PATH"
 mkdir -p "$LOG" "$HF_HOME"
 STEP=${1:-all}
 MODEL=meta-llama/Llama-3.2-1B-Instruct
@@ -31,6 +33,14 @@ setup() {
   if command -v apt-get >/dev/null; then
     SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
     $SUDO apt-get update -qq && $SUDO apt-get install -y -qq git curl build-essential pkg-config libssl-dev python3-dev >/dev/null
+  fi
+
+  if [ ! -d /usr/local/cuda-13.0 ]; then
+    echo "== 1b. CUDA toolkit 13.0（租机镜像通常只有驱动，没有 nvcc）"
+    wget -q -O /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+    dpkg -i /tmp/cuda-keyring.deb >/dev/null && apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cuda-toolkit-13-0 >/dev/null
+    export CUDA_HOME=/usr/local/cuda-13.0 PATH="/usr/local/cuda-13.0/bin:$PATH"
   fi
 
   echo "== 2. 代码: $SRC @ $(git -C "$SRC" log --oneline -1)"
