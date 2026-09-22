@@ -79,6 +79,13 @@ rust_tests() {
   cargo test -p sglang-server 2>&1 | tee "$LOG/cargo_test.log" | grep -E "^test result|FAILED|panicked" || true
 }
 
+prewarm_rust() {
+  # 源码 checkout 下 loader 会在服务器启动时现编 release 版 _server（约 5 分钟），
+  # 会撞上 scheduler 的 300s watchdog；先在独立进程里把指纹缓存编好。
+  echo "== 预热 Rust server 扩展缓存"
+  python -c "from sglang.srt.rust_extensions.loader import load_rust_extension as l; print(l('sglang.srt.rust_extensions._server').__file__)" 2>&1 | grep -v Compiling | tail -2
+}
+
 wait_ready() {  # $1=pid $2=log
   for _ in $(seq 1 300); do
     grep -q "fired up and ready" "$2" && return 0
@@ -91,6 +98,7 @@ wait_ready() {  # $1=pid $2=log
 phase_a() {
   echo "== A 段：默认后端(flashinfer) 起 Rust server，跑 12 项 e2e 检查"
   cd "$SRC"
+  prewarm_rust
   SGLANG_RUST_SERVER=1 setsid python -m sglang.launch_server --model $MODEL --port 30000 > "$LOG/e2e_server.log" 2>&1 &
   PID=$!
   trap "kill -- -$PID 2>/dev/null || true" EXIT
@@ -103,6 +111,7 @@ phase_a() {
 phase_b() {
   echo "== B 段：完整 TestRustServerEndpoint（测试自己起服务器）"
   pgrep -f "sglang.launch_server" && { echo "✗ 还有服务器在跑，先停掉"; exit 1; }
+  cd "$SRC" && prewarm_rust
   cd "$SRC/test/registered/core"
   python -m unittest -v test_srt_endpoint.TestRustServerEndpoint 2>&1 | tee "$LOG/test_rust_endpoint.log" | grep -E "\.\.\. (ok|FAIL|ERROR|skipped)|^Ran |^OK|^FAILED" || true
 }
