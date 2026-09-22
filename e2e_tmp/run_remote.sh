@@ -23,8 +23,9 @@ MODEL=meta-llama/Llama-3.2-1B-Instruct
 
 setup() {
   echo "== 0. 检查 GPU / CUDA 驱动"
-  nvidia-smi | head -12
-  nvidia-smi | grep -q "CUDA Version: 1[3-9]" || { echo "✗ 驱动不支持 CUDA 13，换镜像/机器"; exit 1; }
+  SMI=$(nvidia-smi)  # 不用 `nvidia-smi | head`：pipefail 下 head 提前关管道会让整条命令失败
+  echo "$SMI" | sed -n 1,12p
+  grep -q "CUDA Version: 1[3-9]" <<<"$SMI" || { echo "✗ 驱动不支持 CUDA 13，换镜像/机器"; exit 1; }
 
   echo "== 1. 系统依赖"
   if command -v apt-get >/dev/null; then
